@@ -25,6 +25,10 @@ from reportlab.platypus import (
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.utils import get_column_letter
+
 st.set_page_config(page_title="Sembremos Seguridad - Reporte", layout="wide")
 
 
@@ -104,8 +108,8 @@ def normalize_place_key(v) -> str:
         "anselmo llorente": "anselmo llorente",
         "pacuare": "pacuare",
         "pacuarito": "pacuare",
-        "Vara Blanca": " Vara Blanca",
-        "varablanca": "Vara Blanca",
+        "vara blanca": "vara blanca",
+        "varablanca": "vara blanca",
     }
 
     return alias_map.get(s, s)
@@ -394,7 +398,6 @@ def get_catalog_df(catalogo: pd.DataFrame, delegacion: str, tipo: str) -> pd.Dat
 def get_catalog_delegacion_display(catalogo: pd.DataFrame, delegacion: str) -> str:
     """
     Devuelve el nombre oficial del catálogo para mostrarlo bonito.
-    Ej: si viene 'Canas' desde el archivo, devuelve 'Cañas'.
     """
     if catalogo is None or catalogo.empty:
         return pretty_title(delegacion)
@@ -716,10 +719,187 @@ def build_pdf_bytes(
 
 
 # -----------------------------
+# Consolidado policial global
+# -----------------------------
+def get_meta_policial_delegacion(catalogo: pd.DataFrame, delegacion: str) -> int:
+    df_cat_pol = get_catalog_df(catalogo, delegacion, "Policial")
+    if df_cat_pol.empty:
+        return 0
+    return int(pd.to_numeric(df_cat_pol["Meta"], errors="coerce").fillna(0).sum())
+
+
+def build_policial_global_summary(parsed, catalogo: pd.DataFrame, aplicar_dedupe: bool = False) -> pd.DataFrame:
+    registros = []
+
+    for fname, tipo, lugar, header, data in parsed:
+        if norm(tipo) != "policial":
+            continue
+        if not header:
+            continue
+
+        data_work = data
+        removidas = 0
+
+        if aplicar_dedupe:
+            data_work, removidas = dedupe_within_minutes(header, data_work, minutes=5)
+
+        col_yesno = choose_default_yesno_col(header, data_work)
+        si = sum(1 for r in data_work if is_yes(r[col_yesno]))
+        no = sum(1 for r in data_work if is_no(r[col_yesno]))
+        meta = get_meta_policial_delegacion(catalogo, lugar)
+        delegacion_oficial = get_catalog_delegacion_display(catalogo, lugar)
+        contabilidad = si + no
+        pendiente = max(meta - contabilidad, 0)
+        avance = round((contabilidad / meta) * 100) if meta > 0 else 0
+        cumplio = contabilidad >= meta if meta > 0 else False
+        columna_detectada = header[col_yesno] if 0 <= col_yesno < len(header) else ""
+
+        registros.append({
+            "Delegación": delegacion_oficial,
+            "Archivo": fname,
+            "Meta": int(meta),
+            "SI": int(si),
+            "NO": int(no),
+            "Contabilidad": int(contabilidad),
+            "% Avance": f"{int(avance)}%",
+            "Pendiente": int(pendiente),
+            "Cumplió meta": "Sí" if cumplio else "No",
+            "NO > 30": "Sí" if no > 30 else "No",
+            "Duplicadas eliminadas": int(removidas),
+            "Columna SI/NO detectada": columna_detectada,
+            "Delegacion_key": normalize_place_key(delegacion_oficial)
+        })
+
+    if not registros:
+        return pd.DataFrame(columns=[
+            "Delegación", "Archivo", "Meta", "SI", "NO", "Contabilidad",
+            "% Avance", "Pendiente", "Cumplió meta", "NO > 30",
+            "Duplicadas eliminadas", "Columna SI/NO detectada", "Delegacion_key"
+        ])
+
+    df = pd.DataFrame(registros)
+
+    def unir_archivos(x):
+        vals = [normalize_visible_text(v) for v in x if norm(v) != ""]
+        vals = list(dict.fromkeys(vals))
+        return " | ".join(vals)
+
+    def primera_columna(x):
+        vals = [normalize_visible_text(v) for v in x if norm(v) != ""]
+        vals = list(dict.fromkeys(vals))
+        return " | ".join(vals)
+
+    out = (
+        df.groupby("Delegacion_key", as_index=False)
+        .agg({
+            "Delegación": "first",
+            "Archivo": unir_archivos,
+            "Meta": "max",
+            "SI": "sum",
+            "NO": "sum",
+            "Contabilidad": "sum",
+            "Pendiente": "sum",
+            "Duplicadas eliminadas": "sum",
+            "Columna SI/NO detectada": primera_columna
+        })
+    )
+
+    out["% Avance"] = out.apply(
+        lambda r: f"{int(round((r['Contabilidad'] / r['Meta']) * 100))}%"
+        if int(r["Meta"]) > 0 else "0%",
+        axis=1
+    )
+    out["Pendiente"] = out.apply(
+        lambda r: max(int(r["Meta"]) - int(r["Contabilidad"]), 0),
+        axis=1
+    )
+    out["Cumplió meta"] = out.apply(
+        lambda r: "Sí" if int(r["Meta"]) > 0 and int(r["Contabilidad"]) >= int(r["Meta"]) else "No",
+        axis=1
+    )
+    out["NO > 30"] = out["NO"].apply(lambda x: "Sí" if int(x) > 30 else "No")
+
+    out = out[[
+        "Delegación", "Archivo", "Meta", "SI", "NO", "Contabilidad",
+        "% Avance", "Pendiente", "Cumplió meta", "NO > 30",
+        "Duplicadas eliminadas", "Columna SI/NO detectada"
+    ]].sort_values("Delegación").reset_index(drop=True)
+
+    return out
+
+
+def build_policial_excel_bytes(df: pd.DataFrame) -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Consolidado Policial"
+
+    headers = list(df.columns)
+    ws.append(headers)
+
+    fill_header = PatternFill(fill_type="solid", fgColor="1F4E78")
+    font_header = Font(color="FFFFFF", bold=True)
+    fill_no = PatternFill(fill_type="solid", fgColor="FFC7CE")
+    fill_no_fuerte = PatternFill(fill_type="solid", fgColor="FF0000")
+    font_no_fuerte = Font(color="FFFFFF", bold=True)
+    fill_cumplio_si = PatternFill(fill_type="solid", fgColor="C6EFCE")
+    fill_cumplio_no = PatternFill(fill_type="solid", fgColor="FCE4D6")
+    fill_alerta = PatternFill(fill_type="solid", fgColor="F4CCCC")
+
+    for cell in ws[1]:
+        cell.fill = fill_header
+        cell.font = font_header
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    for row in df.itertuples(index=False):
+        ws.append(list(row))
+
+    idx_no = headers.index("NO") + 1 if "NO" in headers else None
+    idx_cumplio = headers.index("Cumplió meta") + 1 if "Cumplió meta" in headers else None
+    idx_alerta = headers.index("NO > 30") + 1 if "NO > 30" in headers else None
+
+    for r in range(2, ws.max_row + 1):
+        if idx_no is not None:
+            cell_no = ws.cell(row=r, column=idx_no)
+            valor_no = int(cell_no.value) if str(cell_no.value).strip() != "" else 0
+            if valor_no > 30:
+                cell_no.fill = fill_no_fuerte
+                cell_no.font = font_no_fuerte
+            elif valor_no > 0:
+                cell_no.fill = fill_no
+
+        if idx_cumplio is not None:
+            cell_c = ws.cell(row=r, column=idx_cumplio)
+            if norm(cell_c.value) == "si":
+                cell_c.fill = fill_cumplio_si
+            else:
+                cell_c.fill = fill_cumplio_no
+
+        if idx_alerta is not None:
+            cell_a = ws.cell(row=r, column=idx_alerta)
+            if norm(cell_a.value) == "si":
+                cell_a.fill = fill_alerta
+                cell_a.font = Font(bold=True)
+
+    for col_idx, col_name in enumerate(headers, start=1):
+        max_len = len(str(col_name))
+        for r in range(2, ws.max_row + 1):
+            value = ws.cell(row=r, column=col_idx).value
+            max_len = max(max_len, len(str(value)) if value is not None else 0)
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 3, 45)
+
+    ws.freeze_panes = "A2"
+
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out.getvalue()
+
+
+# -----------------------------
 # UI
 # -----------------------------
 st.title("📄 Reporte por Delegación (Comunidad / Comercio / Policial)")
-st.caption("Metas y distritos salen automáticos desde el catálogo. Contabilidad = SI (automático).")
+st.caption("Metas y distritos salen automáticos desde el catálogo. Contabilidad = SI en Comunidad/Comercio y SI+NO en Policial.")
 
 CAT_PATH = "catalogo_metas.xlsx"
 catalogo = load_catalog(CAT_PATH)
@@ -736,6 +916,7 @@ logo_path = "001.png" if Path("001.png").exists() else None
 
 parsed = []
 lugares = set()
+
 for f in files:
     header, data = parse_csv_robusto(f.getvalue())
     tipo, lugar = infer_tipo_lugar(f.name)
@@ -809,6 +990,7 @@ if any(v > 0 for v in removed_info.values()):
 # =========================================================
 st.divider()
 st.subheader("1) ✅ Ubicar los SI/NO (antes del reporte)")
+
 
 def ui_pick_yesno(tipo_label: str, header, data):
     if not header:
@@ -949,8 +1131,93 @@ if st.button("📄 Generar PDF"):
         mime="application/pdf"
     )
 
+
+# =========================================================
+# 4) Consolidado global Policial
+# =========================================================
+st.divider()
+st.subheader("4) Consolidado global de archivos Policial")
+
+policial_count = sum(1 for _, tipo, _, _, _ in parsed if norm(tipo) == "policial")
+st.caption(f"CSV policiales detectados: {policial_count}")
+
+if policial_count == 0:
+    st.info("No se detectaron archivos policiales en la carga actual.")
+else:
+    dedupe_pol_global = st.checkbox("Eliminar duplicadas en todos los CSV policiales ≤ 5 min", value=False)
+
+    df_policial_global = build_policial_global_summary(
+        parsed=parsed,
+        catalogo=catalogo,
+        aplicar_dedupe=dedupe_pol_global
+    )
+
+    if df_policial_global.empty:
+        st.warning("No se pudo construir el consolidado policial.")
+    else:
+        lugares_cumplieron = int((df_policial_global["Cumplió meta"] == "Sí").sum())
+        lugares_no_cumplieron = int((df_policial_global["Cumplió meta"] == "No").sum())
+        total_si_global = int(pd.to_numeric(df_policial_global["SI"], errors="coerce").fillna(0).sum())
+        total_no_global = int(pd.to_numeric(df_policial_global["NO"], errors="coerce").fillna(0).sum())
+        lugares_no_mas_30 = int((df_policial_global["NO > 30"] == "Sí").sum())
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Lugares que cumplieron meta", lugares_cumplieron)
+        c2.metric("Lugares que no cumplieron", lugares_no_cumplieron)
+        c3.metric("Total SI", total_si_global)
+        c4.metric("Total NO", total_no_global)
+        c5.metric("Lugares con NO > 30", lugares_no_mas_30)
+
+        alerta_df = df_policial_global[df_policial_global["NO > 30"] == "Sí"].copy()
+        if not alerta_df.empty:
+            lugares_alerta = ", ".join(alerta_df["Delegación"].astype(str).tolist())
+            st.warning(f"Hay lugares con más de 30 NO: {lugares_alerta}")
+
+        def style_policial_global(row):
+            styles = [""] * len(row)
+            cols = list(row.index)
+
+            if "NO" in cols:
+                idx_no = cols.index("NO")
+                try:
+                    valor_no = int(row["NO"])
+                except Exception:
+                    valor_no = 0
+
+                if valor_no > 30:
+                    styles[idx_no] = "background-color: #ff0000; color: white; font-weight: bold;"
+                elif valor_no > 0:
+                    styles[idx_no] = "background-color: #ffc7ce; color: #9c0006;"
+
+            if "Cumplió meta" in cols:
+                idx_c = cols.index("Cumplió meta")
+                if row["Cumplió meta"] == "Sí":
+                    styles[idx_c] = "background-color: #c6efce; color: #006100; font-weight: bold;"
+                else:
+                    styles[idx_c] = "background-color: #fce4d6; color: #9c0006;"
+
+            if "NO > 30" in cols:
+                idx_a = cols.index("NO > 30")
+                if row["NO > 30"] == "Sí":
+                    styles[idx_a] = "background-color: #f4cccc; color: #990000; font-weight: bold;"
+
+            return styles
+
+        st.dataframe(
+            df_policial_global.style.apply(style_policial_global, axis=1),
+            use_container_width=True
+        )
+
+        excel_policial = build_policial_excel_bytes(df_policial_global)
+
+        st.download_button(
+            "⬇️ Descargar Excel consolidado policial",
+            data=excel_policial,
+            file_name=f"Consolidado_Policial_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
 st.caption(
     "Listo: ahora la app compara por clave robusta y muestra el nombre oficial del catálogo. "
     "Ejemplos: Cañas, Pará, San José de la Montaña, La Ribera, Uruca y Zapote."
 )
-
